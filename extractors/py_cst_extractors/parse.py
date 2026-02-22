@@ -7,7 +7,7 @@ from pathlib import Path
 
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from py_relations import CodeRelation, CodeEntityNode
-from cst_py import ExtractionResult, extract_file, extract_directory, SymbolInfo
+from extractor import ExtractionResult, extract_file, extract_directory, SymbolInfo
 
 
 class CodeGraphStore:
