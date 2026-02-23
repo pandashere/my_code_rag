@@ -6,14 +6,14 @@ from typing import Dict, List, Optional, Any
 from libcst import MaybeSentinel
 import libcst as cst
 
-from utils import (
+from .utils import (
     get_annotation_string,
     extract_decorators,
     extract_type_annotation,
     get_value_hint,
     get_name_string,
 )
-from cst_types import TypeManager
+from .cst_types import TypeManager
 
 
 def extract_base_classes(bases, get_annotation_string_func) -> List[str]:

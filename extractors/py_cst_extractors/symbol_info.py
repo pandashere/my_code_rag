@@ -4,8 +4,8 @@
 from typing import Dict, List, Set, Optional, Tuple, Any
 from dataclasses import dataclass, field
 
-from py_relations import CodeRelation, CodeEntityNode
-from cst_types import TypeManager
+from .py_relations import CodeRelation, CodeEntityNode
+from .cst_types import TypeManager
 
 
 @dataclass
@@ -82,7 +82,7 @@ class ExtractionResult:
         global_symbol_table: Dict[str, "SymbolInfo"]
     ) -> List[CodeRelation]:
         """解析跨文件引用并创建关系"""
-        from relation_parsers import (
+        from .relation_parsers import (
             resolve_super_call_cross_file,
             resolve_by_method_name_cross_file,
         )

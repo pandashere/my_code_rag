@@ -3,8 +3,8 @@
 处理复杂 relation 的解析逻辑
 """
 from typing import Dict, Optional, List
-from symbol_info import SymbolInfo
-from cst_types import TypeManager
+from .symbol_info import SymbolInfo
+from .cst_types import TypeManager
 
 
 def resolve_super_call_cross_file(

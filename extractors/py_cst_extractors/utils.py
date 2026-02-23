@@ -202,6 +202,6 @@ def get_value_hint(value) -> Optional[str]:
     elif isinstance(value, cst.Name):
         return f"ref: {value.value}"
     elif isinstance(value, cst.Call):
-        from node_parsers import get_call_name
+        from .node_parsers import get_call_name
         return get_call_name(value.func)
     return value.code[:50] if hasattr(value, 'code') else None

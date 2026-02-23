@@ -13,10 +13,10 @@ from libcst.metadata import (
     ScopeProvider,
 )
 
-from py_relations import CodeEntityNode
-from cst_types import TypeManager
+from .py_relations import CodeEntityNode
+from .cst_types import TypeManager
 
-from utils import (
+from .utils import (
     serialize_property,
     infer_module_name,
     get_annotation_string,
@@ -26,20 +26,20 @@ from utils import (
     extract_type_annotation,
     get_value_hint
 )
-from node_parsers import (
+from .node_parsers import (
     extract_base_classes,
     extract_parameters,
     get_call_name,
     determine_node_type,
     is_not_sentinel,
 )
-from relation_parsers import (
+from .relation_parsers import (
     resolve_base_class_id,
     resolve_super_call,
     resolve_by_method_name,
     is_cross_file,
 )
-from symbol_info import ExtractionResult, SymbolInfo
+from .symbol_info import ExtractionResult, SymbolInfo
 
 class CodeSymbolExtractor(cst.CSTVisitor):
     """
@@ -48,16 +48,24 @@ class CodeSymbolExtractor(cst.CSTVisitor):
     
     METADATA_DEPENDENCIES = (PositionProvider, ScopeProvider)
 
-    def __init__(self, file_path: str, module_name: Optional[str] = None):
+    def __init__(self, file_path: str, module_name: Optional[str] = None, 
+                source_code: Optional[str] = None):
         """
         初始化提取器
         
         Args:
             file_path: 文件路径
             module_name: 模块名（可选）
+            source_code: 源代码（可选，传入后可直接提取代码段）
         """
         self.file_path = file_path
         self.module_name = module_name or infer_module_name(file_path)
+        
+        # ✅ 缓存源代码和行
+        self.source_code = source_code or ""
+        self.source_lines: List[str] = []
+        if self.source_code:
+            self.source_lines = self.source_code.splitlines(keepends=True)
         
         self.nodes: List[CodeEntityNode] = []
         self.relations: List = []
@@ -74,6 +82,14 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         self.symbol_table: Dict[str, SymbolInfo] = {}
         self._global_symbols: Set[str] = set()
         self.unresolved_calls: List[Dict[str, str]] = []
+        
+        # ✅ 代码段配置
+        self.code_config = {
+            "max_lines": 100,
+            "max_chars": 5000,
+            "context_before": 2,
+            "context_after": 5,
+        }
 
     def _get_line_number(self, node: cst.CSTNode) -> int:
         """
@@ -110,11 +126,131 @@ class CodeSymbolExtractor(cst.CSTVisitor):
                 return f"{parent_id}.{name}"
         return f"{self.module_name}.{name}"
     
+    # extractor.py - 修改 _create_node 方法
+    # extractor.py - 添加以下方法
+
+    def _get_node_span(self, node: cst.CSTNode) -> Dict[str, int]:
+        """
+        ✅ 获取节点的位置信息（起始/结束行、列）
+        
+        Args:
+            node: libcst 节点
+            
+        Returns:
+            位置信息字典
+        """
+        try:
+            position = self._metadata.get(node)
+            if position:
+                return {
+                    "start_line": position.start.line,
+                    "start_col": position.start.column,
+                    "end_line": position.end.line,
+                    "end_col": position.end.column,
+                }
+        except Exception:
+            pass
+        
+        # 降级处理
+        return {
+            "start_line": self._get_line_number(node),
+            "start_col": 0,
+            "end_line": self._get_line_number(node),
+            "end_col": 0,
+        }
+
+    def _extract_code_span(
+        self, 
+        node: cst.CSTNode,
+        add_context: bool = True
+    ) -> Dict[str, Any]:
+        """
+        ✅ 从节点提取代码段
+        
+        Args:
+            node: libcst 节点
+            add_context: 是否添加上下文
+            
+        Returns:
+            代码段信息字典（可直接存入 properties）
+        """
+        if not self.source_lines:
+            return {}
+        
+        span = self._get_node_span(node)
+        start_line = span["start_line"]
+        end_line = span["end_line"]
+        start_col = span["start_col"]
+        end_col = span["end_col"]
+        
+        if start_line < 0:
+            return {}
+        
+        # 转换为 0-based 索引
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(self.source_lines), end_line)
+        
+        # 添加上下文
+        if add_context:
+            ctx_before = self.code_config["context_before"]
+            ctx_after = self.code_config["context_after"]
+            start_idx = max(0, start_idx - ctx_before)
+            end_idx = min(len(self.source_lines), end_idx + ctx_after)
+        
+        # 提取行
+        lines = self.source_lines[start_idx:end_idx]
+        
+        # 处理列偏移
+        if lines:
+            if start_col > 0 and len(lines) > 0:
+                lines[0] = lines[0][start_col:]
+            if end_col > 0 and len(lines) > 1:
+                lines[-1] = lines[-1][:end_col]
+        
+        content = "".join(lines)
+        
+        # 应用限制
+        content = self._apply_code_limits(content)
+        
+        # 计算哈希
+        import hashlib
+        content_hash = hashlib.md5(content.encode()).hexdigest()[:16]
+        
+        return {
+            "code_span": content,
+            "code_start_line": start_line,
+            "code_end_line": end_line,
+            "code_start_col": start_col,
+            "code_end_col": end_col,
+            "code_lines": content.count('\n') + 1,
+            "code_chars": len(content),
+            "code_hash": content_hash,
+        }
+
+    def _apply_code_limits(self, content: str) -> str:
+        """应用代码段限制"""
+        lines = content.splitlines()
+        
+        # 行数限制
+        if len(lines) > self.code_config["max_lines"]:
+            lines = lines[:self.code_config["max_lines"]]
+            lines.append("# ... (truncated)")
+        
+        content = "\n".join(lines)
+        
+        # 字符数限制
+        if len(content) > self.code_config["max_chars"]:
+            content = content[:self.code_config["max_chars"]] + "\n# ... (truncated)"
+        
+        return content
+
     def _create_node(
         self,
         name: str,
         node_type: str,
         extra_properties: Optional[Dict[str, Any]] = None,
+        source_node: Optional[cst.CSTNode] = None,  # ✅ 新增参数
+        extract_code: bool = True,  # ✅ 新增参数
     ) -> CodeEntityNode:
         """
         创建实体节点
@@ -123,6 +259,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             name: 节点名称
             node_type: 节点类型
             extra_properties: 额外属性
+            source_node: 原始 CST 节点（用于提取代码段）
+            extract_code: 是否提取代码段
             
         Returns:
             CodeEntityNode 实例
@@ -139,6 +277,11 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         if self._scope_stack:
             properties["scope"] = self._scope_stack[-1].get('id', '')
         
+        # ✅ 同步提取代码段
+        if extract_code and source_node is not None:
+            code_info = self._extract_code_span(source_node)
+            properties.update(code_info)
+        
         if extra_properties:
             properties.update(extra_properties)
         
@@ -149,8 +292,9 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             module=self.module_name,
             file_path=self.file_path,
             scope=self._scope_stack[-1].get('id') if self._scope_stack else None,
-            extra_properties=extra_properties,
+            extra_properties=properties,
         )
+
     
     def _add_relation(
         self,
@@ -177,7 +321,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         
         self._seen_relations.add(rel_key)
         
-        from py_relations import CodeRelation
+        from .py_relations import CodeRelation
         rel = CodeRelation(
             source_id=source_id,
             target_id=target_id,
@@ -329,12 +473,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         self._pop_scope()
 
     def visit_ClassDef(self, node: cst.ClassDef) -> None:
-        """
-        处理类定义
-        
-        Args:
-            node: 类定义节点
-        """
+        """处理类定义"""
         class_name = node.name.value
         
         if self._scope_stack:
@@ -344,15 +483,17 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         
         base_classes = extract_base_classes(node.bases, get_annotation_string)
         
-        class_node = CodeEntityNode.create(
+        # ✅ 传入 source_node=node，自动提取代码段
+        class_node = self._create_node(
             name=class_name,
             node_type=TypeManager.ENTITY_CLASS,
-            qualified_name=qualified_name,
             extra_properties={
                 "decorators": extract_decorators(node.decorators),
                 "line_number": self._get_line_number(node),
                 "base_classes": base_classes,
-            }
+            },
+            source_node=node,  # ✅ 关键修改
+            extract_code=True,
         )
         self.nodes.append(class_node)
         
@@ -406,12 +547,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             self._current_class_id = None
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
-        """
-        处理函数定义
-        
-        Args:
-            node: 函数定义节点
-        """
+        """处理函数定义"""
         is_async = is_not_sentinel(node.asynchronous)
         func_name = node.name.value
         is_method = self._current_class_id is not None
@@ -423,10 +559,10 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         else:
             qualified_name = f"{self.module_name}.{func_name}"
         
-        func_node = CodeEntityNode.create(
+        # ✅ 传入 source_node=node，自动提取代码段
+        func_node = self._create_node(
             name=func_name,
             node_type=node_type,
-            qualified_name=qualified_name,
             extra_properties={
                 "is_entity": True,
                 "is_async": is_async,
@@ -435,7 +571,9 @@ class CodeSymbolExtractor(cst.CSTVisitor):
                 "parameters": extract_parameters(node.params),
                 "return_type": extract_type_annotation(node.returns),
                 "line_number": self._get_line_number(node),
-            }
+            },
+            source_node=node,  # ✅ 关键修改
+            extract_code=True,
         )
         self.nodes.append(func_node)
         
@@ -579,22 +717,20 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             )
 
     def visit_Assign(self, node: cst.Assign) -> None:
-        """
-        处理赋值语句
-        
-        Args:
-            node: 赋值节点
-        """
+        """处理赋值语句"""
         for target in node.targets:
             if isinstance(target.target, cst.Name):
                 var_name = target.target.value
                 
+                # ✅ 变量也提取代码段（通常较短）
                 var_node = self._create_node(
                     name=var_name,
                     node_type=TypeManager.ENTITY_VARIABLE,
                     extra_properties={
                         "value_hint": get_value_hint(node.value),
-                    }
+                    },
+                    source_node=node,  # ✅ 传入赋值语句节点
+                    extract_code=True,
                 )
                 self.nodes.append(var_node)
                 
@@ -612,12 +748,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
                     self._add_relation(self._current_class_id, var_id, TypeManager.REL_ASSIGNS)
 
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
-        """
-        处理带类型注解的赋值
-        
-        Args:
-            node: 注解赋值节点
-        """
+        """处理带类型注解的赋值"""
         if isinstance(node.target, cst.Name):
             var_name = node.target.value
             type_annotation = extract_type_annotation(node.annotation)
@@ -628,7 +759,9 @@ class CodeSymbolExtractor(cst.CSTVisitor):
                 extra_properties={
                     "type": type_annotation,
                     "value_hint": get_value_hint(node.value) if node.value else None,
-                }
+                },
+                source_node=node,  # ✅ 传入节点
+                extract_code=True,
             )
             self.nodes.append(var_node)
             
@@ -760,6 +893,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
                     {"attribute": attr_name}
                 )
 
+    # extractor.py - 修改 extract 方法
+
     def extract(self, source_code: str) -> ExtractionResult:
         """
         提取代码符号
@@ -770,9 +905,14 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         Returns:
             提取结果
         """
+        # ✅ 缓存源码（用于代码段提取）
+        self.source_code = source_code
+        self.source_lines = source_code.splitlines(keepends=True)
+        
         self.module = cst.parse_module(source_code)
         
         wrapper = MetadataWrapper(self.module, unsafe_skip_copy=True)
+        self._metadata = wrapper.resolve(PositionProvider)  # ✅ 缓存位置元数据
         wrapper.visit(self)
         
         for node in self.nodes:
@@ -799,6 +939,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         )
 
 
+# extractor.py - 修改 extract_file 函数
+
 def extract_file(file_path: str, module_name: Optional[str] = None) -> ExtractionResult:
     """
     提取单个文件的符号
@@ -814,14 +956,17 @@ def extract_file(file_path: str, module_name: Optional[str] = None) -> Extractio
     if not path.exists():
         return ExtractionResult(errors=[f"文件不存在：{file_path}"])
     
+    # ✅ 读取源码并传入
     source_code = path.read_text(encoding='utf-8')
     
     extractor = CodeSymbolExtractor(
         file_path=str(path.absolute()),
         module_name=module_name,
+        source_code=source_code,  # ✅ 传入源码
     )
     
     return extractor.extract(source_code)
+
 
 
 def extract_directory(

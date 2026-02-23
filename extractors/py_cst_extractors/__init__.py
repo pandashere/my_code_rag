@@ -9,12 +9,12 @@
     - extractor.py: 主提取器类
 """
 
-from extractor import (
+from  .extractor import (
     CodeSymbolExtractor,
     extract_file,
     extract_directory,
 )
-from symbol_info import (
+from .symbol_info import (
     SymbolInfo,
     ExtractionResult,
 )
