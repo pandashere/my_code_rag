@@ -17,7 +17,7 @@ class CodeKGIndexBuilder:
         self.embed_model = embed_model
         
         # ✅ CodeKGExtractor 本身就是 TransformComponent
-        self.kg_extractor = CodeKGExtractor(source_root=source_root)
+        self.kg_extractor = CodeKGExtractor(source_root, True, self.llm)
         
         # ✅ Neo4j Graph Store
         from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore

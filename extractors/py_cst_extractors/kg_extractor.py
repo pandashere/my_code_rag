@@ -93,12 +93,14 @@ class CodeKGExtractor(TransformComponent):
         # 3. 从 results 构建 TextNode 列表
         nodes = self._build_nodes_from_results()
         
+        # 5. Cache KG 数据（每个 TextNode 关联的 EntityNode + Relation）
+        self._cache_kg_data(nodes)
         # 4. ✅ 可选：生成 LLM summary
         if self.enable_llm_summary and self.summary_model:
             nodes = self._generate_llm_summaries(nodes)
         
-        # 5. Cache KG 数据（每个 TextNode 关联的 EntityNode + Relation）
-        self._cache_kg_data(nodes)
+        
+        
         
         # 6. 存储所有 nodes
         self._all_nodes = nodes
@@ -238,56 +240,171 @@ class CodeKGExtractor(TransformComponent):
             metadata=metadata,
         )
     
+
     def _generate_llm_summaries(self, nodes: List[BaseNode]) -> List[BaseNode]:
         """
-        ✅ 使用 LLM 为每个节点生成摘要
-        
-        摘要会添加到：
-        - node.metadata["llm_summary"]
-        - node.text (追加到末尾)
+        ✅ DFS 后序遍历生成 LLM 摘要（先子后父）
+        - FUNCTION: 收集 CALLS + CONTAINS 的子摘要
+        - MODULE: 仅收集 CONTAINS 的子摘要
+        - 过长函数跳过 LLM 和子摘要收集
         """
         print(f"🤖 开始生成 LLM 摘要 ({len(nodes)} 个节点)...")
         
-        # 构建 prompt
-        prompt_template = """
-请为以下代码实体生成简洁的功能摘要（50 字以内）：
-
-实体名称：{name}
-实体类型：{node_type}
-代码内容：
-```python
-{code}"""
-        # 批量生成（避免 API 限制）
-        batch_size = 10
-        for i in range(0, len(nodes), batch_size):
-            batch = nodes[i:i + batch_size]
-            
-            for node in batch:
-                try:
-                    code = node.metadata.get("code_span", "")
-                    if not code:
-                        continue
-                    
-                    prompt = prompt_template.format(
-                        name=node.metadata.get("qualified_name", ""),
-                        node_type=node.metadata.get("node_type", ""),
-                        code=code[:1000],  # 限制代码长度
-                    )
-                    
-                    # 调用 LLM
-                    response = self.summary_model.complete(prompt)
-                    summary = response.text.strip()
-                    
-                    # ✅ 存储摘要
-                    node.metadata["llm_summary"] = summary
-                    
-                except Exception as e:
-                    print(f"⚠️ 生成摘要失败：{e}")
-                    node.metadata["llm_summary"] = ""
-            
-            print(f"   进度：{min(i + batch_size, len(nodes))}/{len(nodes)}")
+        MAX_FUNCTION_CODE_LENGTH = 2000
+        TOO_LONG_SUMMARY = "This function is too long to summarize."
         
-        print(f"✅ LLM 摘要生成完成")
+        # ========== 1. 构建索引 ==========
+        node_map = {node.id_: node for node in nodes}
+        
+        entity_map = {}
+        for node in nodes:
+            if node.id_ in self._cache:
+                entity, relations = self._cache[node.id_]
+                entity_map[node.id_] = (entity, relations)
+            else:
+                entity_map[node.id_] = (None, [])
+        
+        # ========== 2. DFS 后序遍历 + 即时处理 ==========
+        visited = set()
+        processing = set()  # 防止循环依赖
+        
+        def dfs(node_id: str):
+            """DFS 后序遍历：先递归处理子节点，再处理当前节点"""
+            if node_id in visited:
+                return
+            if node_id in processing:
+                # 循环依赖，跳过
+                return
+            if node_id not in node_map:
+                return
+            
+            processing.add(node_id)
+            node = node_map[node_id]
+            
+            # --- 先处理所有子节点 (CALLS + CONTAINS) ---
+            _, relations = entity_map.get(node_id, (None, []))
+            for rel in relations:
+                if rel.label in ("CALLS", "CONTAINS"):
+                    dfs(rel.target_id)
+            
+            # --- 再处理当前节点 (后序) ---
+            _process_node(node)
+            
+            processing.remove(node_id)
+            visited.add(node_id)
+        
+        def _process_node(node: BaseNode):
+            """处理单个节点的摘要生成"""
+            if node.metadata.get("llm_summary"):
+                return
+            
+            node_type = node.metadata.get("node_type")
+            if not node_type:
+                entity, _ = entity_map.get(node.id_, (None, None))
+                if entity and hasattr(entity, 'label'):
+                    node_type = entity.label
+                else:
+                    node_type = "UNKNOWN"
+            
+            fallback_summary = node.id_
+            
+            try:
+                if node_type == "FUNCTION":
+                    code = node.metadata.get("code_span", "")
+                    func_name = node.metadata.get("qualified_name", node.id_)
+                    
+                    if len(code) > MAX_FUNCTION_CODE_LENGTH:
+                        summary = TOO_LONG_SUMMARY
+                    elif not code.strip():
+                        summary = fallback_summary
+                    else:
+                        # 收集子摘要 (CALLS + CONTAINS)
+                        child_summaries = _get_child_summaries(
+                            node.id_, 
+                            ["CALLS", "CONTAINS"]
+                        )
+                        
+                        prompt = function_prompt_template.format(
+                            func_name=func_name,
+                            code_snippet=code
+                        )
+                        response = self.summary_model.complete(prompt)
+                        raw_text = response.text.strip()
+                        
+                        if "【功能】" in raw_text and "【局限】" in raw_text:
+                            func_part = raw_text.split("【功能】")[1].split("【局限】")[0].strip()
+                            limit_part = raw_text.split("【局限】")[1].strip()
+                            func_part = func_part.rstrip("。.").strip()
+                            limit_part = limit_part.rstrip("。.").strip()
+                            summary = f"{func_part} | {limit_part}"
+                        else:
+                            summary = raw_text[:100]
+                
+                elif node_type == "MODULE":
+                    # 仅收集 CONTAINS
+                    child_summaries = _get_child_summaries(
+                        node.id_, 
+                        ["CONTAINS"]
+                    )
+                    child_summaries_str = "；".join(child_summaries) if child_summaries else "无内容"
+                    
+                    prompt = module_prompt_template.format(
+                        child_summaries_str=child_summaries_str[:800]
+                    )
+                    response = self.summary_model.complete(prompt)
+                    summary = response.text.strip()[:60]
+                
+                else:
+                    summary = fallback_summary
+                
+                node.metadata["llm_summary"] = summary or fallback_summary
+                
+            except Exception as e:
+                print(f"⚠️ 节点 {node.id_} 摘要生成失败：{e}")
+                node.metadata["llm_summary"] = node.id_
+        
+        def _get_child_summaries(node_id: str, allowed_rel_labels: List[str]) -> List[str]:
+            """收集子节点摘要（DFS 保证子节点已处理）"""
+            summaries = []
+            _, relations = entity_map.get(node_id, (None, []))
+            for rel in relations:
+                if rel.label in allowed_rel_labels and rel.target_id in node_map:
+                    child_node = node_map[rel.target_id]
+                    child_summary = child_node.metadata.get("llm_summary")
+                    if child_summary:
+                        summaries.append(child_summary)
+            return summaries
+
+        # ========== 3. Prompt 模板 ==========
+        function_prompt_template = """你是一个严谨的代码审查专家。请根据以下信息生成两段极简描述：
+
+    函数名：{func_name}
+    代码实现：
+    {code_snippet}
+
+    要求：
+    - 【功能】：用 ≤30 字概括该函数实际做了什么（忽略函数名，仅看代码）。
+    - 【局限】：仅当函数名/功能与实际实现存在不一致、隐藏限制、未声明依赖时指出（≤50字）。例如：
+        • 名为 `validate_email` 但未检查格式；
+        • 声称"线程安全"但使用了全局变量；
+        • 要求输入非空但未校验；
+        • 仅支持 Python 3.8+ 但未说明。
+    若完全一致，写"无"。
+    """
+
+        module_prompt_template = """你是一个代码分析专家。请为以下模块生成极简描述（≤50字）：
+    包含的组件摘要：
+    {child_summaries_str}
+    """
+
+        # ========== 4. 启动 DFS ==========
+        processed_count = 0
+        for node in nodes:
+            if node.id_ not in visited:
+                dfs(node.id_)
+                processed_count += 1
+        
+        print(f"✅ LLM 摘要生成完成 (共 {len(visited)} 个节点)")
         return nodes
 
     def _cache_kg_data(self, nodes: List[BaseNode]) -> None:
@@ -372,10 +489,10 @@ class CodeKGExtractor(TransformComponent):
         ✅ 从 properties 获取属性
         """
         qname = code_node.properties.get("qualified_name", code_node.id)
-        file_path = code_node.properties.get("file_path", "unknown")
-        unique_str = f"{qname}_{file_path}"
-        hash_id = hashlib.md5(unique_str.encode()).hexdigest()[:16]
-        return f"code_node_{hash_id}"
+        # file_path = code_node.properties.get("file_path", "unknown")
+        # unique_str = f"{qname}_{file_path}"
+        # hash_id = hashlib.md5(unique_str.encode()).hexdigest()[:16]
+        return qname
 
     def _build_node_text(self, code_node: CodeEntityNode) -> str:
         """
