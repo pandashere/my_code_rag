@@ -99,9 +99,6 @@ class CodeKGExtractor(TransformComponent):
         if self.enable_llm_summary and self.summary_model:
             nodes = self._generate_llm_summaries(nodes)
         
-        
-        
-        
         # 6. 存储所有 nodes
         self._all_nodes = nodes
         
@@ -195,9 +192,14 @@ class CodeKGExtractor(TransformComponent):
         """从 results 构建 TextNode 列表"""
         nodes = []
         node_id_map = {}
+        seen_qnames = set()
         
         for result in self._file_results:
             for code_node in result.nodes:
+                qname = code_node.properties.get("qualified_name", code_node.id)
+                if qname in seen_qnames:
+                    continue
+                seen_qnames.add(qname)
                 text_node = self._code_node_to_text_node(code_node)
                 nodes.append(text_node)
                 node_id_map[code_node.id] = text_node.id_
@@ -235,7 +237,7 @@ class CodeKGExtractor(TransformComponent):
         text = self._build_node_text(code_node)
         
         return TextNode(
-            id_=node_id,
+            id_=node_id+"_chunk",
             text=text,
             metadata=metadata,
         )
@@ -255,14 +257,17 @@ class CodeKGExtractor(TransformComponent):
         
         # ========== 1. 构建索引 ==========
         node_map = {node.id_: node for node in nodes}
-        
+        qname_to_chunk_id = {
+            node.metadata.get("qualified_name"): node.id_
+            for node in nodes
+            if node.metadata.get("qualified_name")
+        }
+
         entity_map = {}
         for node in nodes:
-            if node.id_ in self._cache:
-                entity, relations = self._cache[node.id_]
-                entity_map[node.id_] = (entity, relations)
-            else:
-                entity_map[node.id_] = (None, [])
+            kg_nodes, relations = self._cache.get(node.id_, ([], []))
+            entity = kg_nodes[0] if kg_nodes else None
+            entity_map[node.id_] = (entity, relations)
         
         # ========== 2. DFS 后序遍历 + 即时处理 ==========
         visited = set()
@@ -285,7 +290,9 @@ class CodeKGExtractor(TransformComponent):
             _, relations = entity_map.get(node_id, (None, []))
             for rel in relations:
                 if rel.label in ("CALLS", "CONTAINS"):
-                    dfs(rel.target_id)
+                    target_chunk_id = qname_to_chunk_id.get(rel.target_id)
+                    if target_chunk_id:
+                        dfs(target_chunk_id)
             
             # --- 再处理当前节点 (后序) ---
             _process_node(node)
@@ -309,7 +316,7 @@ class CodeKGExtractor(TransformComponent):
             fallback_summary = node.id_
             
             try:
-                if node_type == "FUNCTION":
+                if node_type in ("FUNCTION", "METHOD", "ASYNC_FUNCTION", "ASYNC_METHOD"):
                     code = node.metadata.get("code_span", "")
                     func_name = node.metadata.get("qualified_name", node.id_)
                     
@@ -323,10 +330,12 @@ class CodeKGExtractor(TransformComponent):
                             node.id_, 
                             ["CALLS", "CONTAINS"]
                         )
+                        child_summaries_str = "；".join(child_summaries) if child_summaries else "无"
                         
                         prompt = function_prompt_template.format(
                             func_name=func_name,
-                            code_snippet=code
+                            code_snippet=code,
+                            child_summaries_str=child_summaries_str[:800],
                         )
                         response = self.summary_model.complete(prompt)
                         raw_text = response.text.strip()
@@ -336,7 +345,7 @@ class CodeKGExtractor(TransformComponent):
                             limit_part = raw_text.split("【局限】")[1].strip()
                             func_part = func_part.rstrip("。.").strip()
                             limit_part = limit_part.rstrip("。.").strip()
-                            summary = f"{func_part} | {limit_part}"
+                            summary = f"Description: {func_part} \n Limit:{limit_part}"
                         else:
                             summary = raw_text[:100]
                 
@@ -368,8 +377,9 @@ class CodeKGExtractor(TransformComponent):
             summaries = []
             _, relations = entity_map.get(node_id, (None, []))
             for rel in relations:
-                if rel.label in allowed_rel_labels and rel.target_id in node_map:
-                    child_node = node_map[rel.target_id]
+                target_chunk_id = qname_to_chunk_id.get(rel.target_id)
+                if rel.label in allowed_rel_labels and target_chunk_id in node_map:
+                    child_node = node_map[target_chunk_id]
                     child_summary = child_node.metadata.get("llm_summary")
                     if child_summary:
                         summaries.append(child_summary)
@@ -379,17 +389,19 @@ class CodeKGExtractor(TransformComponent):
         function_prompt_template = """你是一个严谨的代码审查专家。请根据以下信息生成两段极简描述：
 
     函数名：{func_name}
+    子调用/子组件摘要：
+    {child_summaries_str}
     代码实现：
     {code_snippet}
 
     要求：
-    - 【功能】：用 ≤30 字概括该函数实际做了什么（忽略函数名，仅看代码）。
+    - 【功能】：用 ≤30 字概括该函数实际做了什么。
     - 【局限】：仅当函数名/功能与实际实现存在不一致、隐藏限制、未声明依赖时指出（≤50字）。例如：
         • 名为 `validate_email` 但未检查格式；
         • 声称"线程安全"但使用了全局变量；
         • 要求输入非空但未校验；
-        • 仅支持 Python 3.8+ 但未说明。
-    若完全一致，写"无"。
+        • 有函数名无法体现的修改变量行为；
+    若完全一致，写"None"。
     """
 
         module_prompt_template = """你是一个代码分析专家。请为以下模块生成极简描述（≤50字）：

@@ -48,8 +48,13 @@ class CodeSymbolExtractor(cst.CSTVisitor):
     
     METADATA_DEPENDENCIES = (PositionProvider, ScopeProvider)
 
-    def __init__(self, file_path: str, module_name: Optional[str] = None, 
-                source_code: Optional[str] = None):
+    def __init__(
+        self,
+        file_path: str,
+        module_name: Optional[str] = None,
+        source_code: Optional[str] = None,
+        source_root: Optional[str] = None,
+    ):
         """
         初始化提取器
         
@@ -59,7 +64,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             source_code: 源代码（可选，传入后可直接提取代码段）
         """
         self.file_path = file_path
-        self.module_name = module_name or infer_module_name(file_path)
+        self.source_root = source_root
+        self.module_name = module_name or infer_module_name(file_path, source_root=source_root)
         
         # ✅ 缓存源代码和行
         self.source_code = source_code or ""
@@ -120,6 +126,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         Returns:
             节点 ID
         """
+        if scope_type == TypeManager.ENTITY_MODULE:
+            return self.module_name
         if scope_type and self._scope_stack:
             parent_id = self._scope_stack[-1].get('id', '')
             if parent_id:
@@ -352,7 +360,10 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         Returns:
             限定名
         """
-        if self._scope_stack:
+        if node_type in (TypeManager.ENTITY_MODULE, TypeManager.ENTITY_MODULE_IMPORT):
+            qualified_name = node_id
+            self._global_symbols.add(qualified_name)
+        elif self._scope_stack:
             qualified_name = f"{self._scope_stack[-1]['id']}.{name}"
         else:
             qualified_name = f"{self.module_name}.{name}"
@@ -432,15 +443,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             }
         )
         self.nodes.append(module_node)
-        
-        self._register_symbol(
-            name=module_name.split('.')[-1],
-            node_type=TypeManager.ENTITY_MODULE_IMPORT,
-            node=None,
-            node_id=module_node.id,
-            extra_properties={"module_name": module_name},
-        )
-        
+
         return module_node.id
 
     def visit_Module(self, node: cst.Module) -> None:
@@ -700,7 +703,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             else:
                 alias_name = imported_name
             
-            full_name = f"{module_name}.{alias_name}" if module_name else alias_name
+            full_name = f"{module_name}.{imported_name}" if module_name else imported_name
             self._import_map[alias_name] = full_name
             
             module_node_id = self._ensure_module_node(module_name)
@@ -941,7 +944,11 @@ class CodeSymbolExtractor(cst.CSTVisitor):
 
 # extractor.py - 修改 extract_file 函数
 
-def extract_file(file_path: str, module_name: Optional[str] = None) -> ExtractionResult:
+def extract_file(
+    file_path: str,
+    module_name: Optional[str] = None,
+    source_root: Optional[str] = None,
+) -> ExtractionResult:
     """
     提取单个文件的符号
     
@@ -952,17 +959,21 @@ def extract_file(file_path: str, module_name: Optional[str] = None) -> Extractio
     Returns:
         提取结果
     """
-    path = Path(file_path)
+    path = Path(file_path).resolve()
     if not path.exists():
         return ExtractionResult(errors=[f"文件不存在：{file_path}"])
+
+    if module_name is None:
+        module_name = infer_module_name(str(path), source_root=source_root)
     
     # ✅ 读取源码并传入
     source_code = path.read_text(encoding='utf-8')
     
     extractor = CodeSymbolExtractor(
-        file_path=str(path.absolute()),
+        file_path=str(path),
         module_name=module_name,
         source_code=source_code,  # ✅ 传入源码
+        source_root=source_root,
     )
     
     return extractor.extract(source_code)
@@ -985,7 +996,7 @@ def extract_directory(
     Returns:
         Tuple: (单个文件结果列表，合并后的全局符号表，跨文件关系列表)
     """
-    path = Path(dir_path)
+    path = Path(dir_path).resolve()
     if not path.is_dir():
         raise ValueError(f"不是目录：{dir_path}")
     
@@ -1002,6 +1013,7 @@ def extract_directory(
     py_files = list(path.glob(pattern))
     
     for py_file in py_files:
+        py_file = py_file.resolve()
         should_exclude = False
         for exclude in exclude_patterns:
             if fnmatch(str(py_file), exclude):
@@ -1011,7 +1023,7 @@ def extract_directory(
         if should_exclude:
             continue
         
-        result = extract_file(str(py_file))
+        result = extract_file(str(py_file), source_root=str(path))
         results.append(result)
     
     global_symbol_table = ExtractionResult.merge_symbol_tables(results)

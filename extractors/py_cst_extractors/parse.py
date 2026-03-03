@@ -2,12 +2,11 @@
 Neo4j 图存储封装
 """
 
-from typing import List, Optional, Dict, Any, Tuple
-from pathlib import Path
+from typing import List, Optional, Dict, Any
 
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-from py_relations import CodeRelation, CodeEntityNode
-from extractor import ExtractionResult, extract_file, extract_directory, SymbolInfo
+from .py_relations import CodeRelation
+from .extractor import ExtractionResult, extract_directory, SymbolInfo
 
 
 class CodeGraphStore:
@@ -92,29 +91,28 @@ class CodeGraphStore:
         self.close()
 
 
+if __name__ == "__main__":
+    # 方式 2: 提取并存储到 Neo4j
+    with CodeGraphStore(
+        url="bolt://localhost:7687",
+        username="neo4j",
+        password="your_password",
+    ) as store:
+        # 导入整个项目
+        stats = store.insert_directory(
+            "/home/zhaochen/code-reg/code-venv/lib64/python3.12/site-packages/aiohttp",
+            # "/home/zhaochen/code-reg/code_rag",
+            exclude_patterns=["**/tests/**", "**/__pycache__/**"],
+        )
+        print(f"导入完成：{stats}")
 
-
-
-
-# 方式 2: 提取并存储到 Neo4j
-with CodeGraphStore(
-    url="bolt://localhost:7687",
-    username="neo4j",
-    password="your_password",
-) as store:
-    # 导入整个项目
-    stats = store.insert_directory(
-        "/home/zhaochen/code-reg/code-venv/lib64/python3.12/site-packages/aiohttp",
-        # "/home/zhaochen/code-reg/code_rag",
-        exclude_patterns=["**/tests/**", "**/__pycache__/**"],
-    )
-    print(f"导入完成：{stats}")
-    
-    # 查询示例
-    results = store.query("""
-        MATCH (f:FUNCTION)-[:CALLS]->(g:FUNCTION)
-        RETURN f.name as caller, g.name as callee
-        LIMIT 10
-    """)
-    for row in results:
-        print(f"{row['caller']} -> {row['callee']}")
+        # 查询示例
+        results = store.query(
+            """
+            MATCH (f:FUNCTION)-[:CALLS]->(g:FUNCTION)
+            RETURN f.name as caller, g.name as callee
+            LIMIT 10
+            """
+        )
+        for row in results:
+            print(f"{row['caller']} -> {row['callee']}")

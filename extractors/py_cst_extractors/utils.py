@@ -25,7 +25,7 @@ def serialize_property(value: Any) -> Any:
     return str(value)
 
 
-def infer_module_name(file_path: str) -> str:
+def infer_module_name(file_path: str, source_root: Optional[str] = None) -> str:
     """
     从文件路径推断模块名
     
@@ -35,14 +35,30 @@ def infer_module_name(file_path: str) -> str:
     Returns:
         模块名
     """
-    path = Path(file_path)
-    parts = []
-    for part in path.parts:
-        if part.endswith('.py'):
-            parts.append(part[:-3])
-        elif part != '__init__':
-            parts.append(part)
-    return '.'.join(parts)
+    path = Path(file_path).resolve()
+    module_path = path
+
+    if source_root:
+        root = Path(source_root).resolve()
+        try:
+            module_path = path.relative_to(root)
+        except ValueError:
+            module_path = path
+
+    module_no_suffix = module_path.with_suffix("") if module_path.suffix == ".py" else module_path
+    parts = list(module_no_suffix.parts)
+
+    # package/__init__.py -> package
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+
+    # fallback for root __init__.py
+    if not parts:
+        if source_root:
+            return Path(source_root).resolve().name
+        return path.stem
+
+    return ".".join(parts)
 
 
 def get_annotation_string(node) -> str:

@@ -97,7 +97,7 @@ def get_call_name(func: cst.CSTNode) -> Optional[str]:
             return f"{obj_name}.{attr_name}"
         
         elif isinstance(func.value, cst.Attribute):
-            from utils import get_attribute_name
+            from .utils import get_attribute_name
             obj_name = get_attribute_name(func.value)
             return f"{obj_name}.{attr_name}"
         
