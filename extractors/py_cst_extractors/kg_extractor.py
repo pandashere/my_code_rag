@@ -9,8 +9,8 @@
 ✅ 【修复】Relation 表示 Entity 之间的关系，不是 TextNode 之间的关系
 """
 from typing import List, Optional, Dict, Any, Sequence, Tuple
-from pathlib import Path
-import hashlib
+import json
+import re
 
 from llama_index.core.schema import BaseNode, TextNode, NodeRelationship, RelatedNodeInfo, TransformComponent
 from llama_index.core.graph_stores.types import (
@@ -40,6 +40,7 @@ class CodeKGExtractor(TransformComponent):
         default="hybrid",
         description="摘要策略: independent|hybrid|bottom_up",
     )
+    relation_view_limit: int = Field(default=8, description="每类关系视图保留的节点数")
     
     _cache: Dict[str, Tuple[List[EntityNode], List[Relation]]] = PrivateAttr(default_factory=dict)
     _all_nodes: List[BaseNode] = PrivateAttr(default_factory=list)
@@ -62,6 +63,7 @@ class CodeKGExtractor(TransformComponent):
         enable_llm_summary: bool = False,
         summary_model: Optional[Any] = None,
         summary_strategy: str = "hybrid",
+        relation_view_limit: int = 8,
         **kwargs: Any
     ):
         """初始化"""
@@ -70,6 +72,7 @@ class CodeKGExtractor(TransformComponent):
             enable_llm_summary=enable_llm_summary,
             summary_model=summary_model,
             summary_strategy=summary_strategy,
+            relation_view_limit=relation_view_limit,
             **kwargs
         )
         self._cache = {}
@@ -101,11 +104,21 @@ class CodeKGExtractor(TransformComponent):
         
         # 5. Cache KG 数据（每个 TextNode 关联的 EntityNode + Relation）
         self._cache_kg_data(nodes)
-        # 4. ✅ 可选：生成 LLM summary
+
+        # 6. 一次性生成结构化汇聚信息（非 lazy）
+        self._build_structured_enrichment(nodes)
+
+        # 7. 可选：生成 LLM summary（覆盖/补充 composed_summary）
         if self.enable_llm_summary and self.summary_model:
             nodes = self._generate_llm_summaries(nodes)
+        else:
+            for node in nodes:
+                if not node.metadata.get("llm_summary"):
+                    node.metadata["llm_summary"] = node.metadata.get(
+                        "composed_summary", node.id_
+                    )
         
-        # 6. 存储所有 nodes
+        # 8. 存储所有 nodes
         self._all_nodes = nodes
         
         print(f"✅ extract 完成：{len(nodes)} 个 TextNode")
@@ -242,6 +255,23 @@ class CodeKGExtractor(TransformComponent):
             "module": code_node.properties.get("module", ""),
             "scope": code_node.properties.get("scope", ""),
         }
+
+        for key in (
+            "parameters",
+            "return_type",
+            "decorators",
+            "base_classes",
+            "is_async",
+            "is_method",
+            "value_hint",
+            "type",
+            "code_start_line",
+            "code_end_line",
+            "code_lines",
+            "code_chars",
+        ):
+            if key in code_node.properties:
+                metadata[key] = code_node.properties.get(key)
         
         # ✅ 添加代码段
         if "code_span" in code_node.properties:
@@ -257,7 +287,268 @@ class CodeKGExtractor(TransformComponent):
             text=text,
             metadata=metadata,
         )
-    
+
+    def _safe_json_load(self, value: Any, default: Any) -> Any:
+        if value is None:
+            return default
+        if isinstance(value, (dict, list, bool, int, float)):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return default
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return default
+            return value
+        return default
+
+    def _split_identifier_tokens(self, identifier: str) -> List[str]:
+        if not identifier:
+            return []
+        base = identifier.split(".")[-1]
+        camel_parts = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", base)
+        tokens = [t.lower() for t in re.split(r"[_\W]+", camel_parts) if t]
+        return tokens
+
+    def _extract_code_identifiers(self, code_span: str, limit: int = 120) -> List[str]:
+        if not code_span:
+            return []
+        words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code_span)
+        seen = set()
+        results = []
+        for w in words:
+            lw = w.lower()
+            if lw in seen:
+                continue
+            seen.add(lw)
+            results.append(lw)
+            if len(results) >= limit:
+                break
+        return results
+
+    def _short_qname(self, qname: str) -> str:
+        if not qname:
+            return ""
+        parts = qname.split(".")
+        if len(parts) <= 3:
+            return qname
+        return ".".join(parts[-3:])
+
+    def _format_relation_text(self, items: List[str], total: int, prefix: str) -> str:
+        if total <= 0:
+            return f"{prefix}: none"
+        shown = ", ".join(self._short_qname(x) for x in items) if items else ""
+        return f"{prefix} ({total}): {shown}"
+
+    def _build_relation_indexes(self) -> Tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]:
+        outgoing: Dict[str, Dict[str, List[str]]] = {}
+        incoming: Dict[str, Dict[str, List[str]]] = {}
+        for rel in self._relation_pool:
+            outgoing.setdefault(rel.source_id, {}).setdefault(rel.label, []).append(rel.target_id)
+            incoming.setdefault(rel.target_id, {}).setdefault(rel.label, []).append(rel.source_id)
+        return outgoing, incoming
+
+    def _build_fact_card(
+        self,
+        node: BaseNode,
+        out_index: Dict[str, Dict[str, List[str]]],
+        in_index: Dict[str, Dict[str, List[str]]],
+    ) -> Dict[str, Any]:
+        metadata = node.metadata or {}
+        qname = metadata.get("qualified_name", "")
+        node_type = metadata.get("node_type", "UNKNOWN")
+
+        parameters = self._safe_json_load(metadata.get("parameters"), [])
+        if not isinstance(parameters, list):
+            parameters = []
+
+        decorators = self._safe_json_load(metadata.get("decorators"), [])
+        if not isinstance(decorators, list):
+            decorators = []
+
+        base_classes = self._safe_json_load(metadata.get("base_classes"), [])
+        if not isinstance(base_classes, list):
+            base_classes = []
+
+        code_span = metadata.get("code_span", "")
+        signature = ""
+        if code_span:
+            for line in code_span.splitlines():
+                striped = line.strip()
+                if striped.startswith("def ") or striped.startswith("class "):
+                    signature = striped
+                    break
+
+        outgoing = out_index.get(qname, {})
+        incoming = in_index.get(qname, {})
+
+        return {
+            "qualified_name": qname,
+            "node_type": node_type,
+            "module": metadata.get("module", ""),
+            "file_path": metadata.get("file_path", ""),
+            "line_number": metadata.get("line_number", 0),
+            "signature": signature,
+            "parameters": parameters,
+            "return_type": metadata.get("return_type", ""),
+            "decorators": decorators,
+            "base_classes": base_classes,
+            "is_async": bool(metadata.get("is_async", False)),
+            "is_method": bool(metadata.get("is_method", False)),
+            "code_lines": metadata.get("code_lines", 0),
+            "out_relation_counts": {k: len(v) for k, v in outgoing.items()},
+            "in_relation_counts": {k: len(v) for k, v in incoming.items()},
+        }
+
+    def _build_relation_views(
+        self,
+        node: BaseNode,
+        out_index: Dict[str, Dict[str, List[str]]],
+        in_index: Dict[str, Dict[str, List[str]]],
+    ) -> Dict[str, Any]:
+        metadata = node.metadata or {}
+        qname = metadata.get("qualified_name", "")
+        outgoing = out_index.get(qname, {})
+        incoming = in_index.get(qname, {})
+
+        def pack(items: List[str]) -> Dict[str, Any]:
+            total = len(items)
+            top_items = items[: self.relation_view_limit]
+            return {"count": total, "items": top_items}
+
+        calls = pack(outgoing.get("CALLS", []))
+        called_by = pack(incoming.get("CALLS", []))
+        contains = pack(outgoing.get("CONTAINS", []))
+        contained_by = pack(incoming.get("CONTAINS", []))
+        imports = pack(outgoing.get("IMPORTS", []))
+        imported_by = pack(incoming.get("IMPORTS", []))
+        inherits = pack(outgoing.get("INHERITS", []))
+        inherited_by = pack(incoming.get("INHERITS", []))
+        uses = pack(outgoing.get("USES", []))
+        used_by = pack(incoming.get("USES", []))
+
+        text_views = {
+            "calls_view": self._format_relation_text(calls["items"], calls["count"], "Calls"),
+            "called_by_view": self._format_relation_text(called_by["items"], called_by["count"], "Called by"),
+            "contains_view": self._format_relation_text(contains["items"], contains["count"], "Contains"),
+            "contained_by_view": self._format_relation_text(contained_by["items"], contained_by["count"], "Contained by"),
+            "imports_view": self._format_relation_text(imports["items"], imports["count"], "Imports"),
+            "imported_by_view": self._format_relation_text(imported_by["items"], imported_by["count"], "Imported by"),
+            "inherits_view": self._format_relation_text(inherits["items"], inherits["count"], "Inherits"),
+            "inherited_by_view": self._format_relation_text(inherited_by["items"], inherited_by["count"], "Inherited by"),
+            "uses_view": self._format_relation_text(uses["items"], uses["count"], "Uses"),
+            "used_by_view": self._format_relation_text(used_by["items"], used_by["count"], "Used by"),
+        }
+
+        return {
+            "calls": calls,
+            "called_by": called_by,
+            "contains": contains,
+            "contained_by": contained_by,
+            "imports": imports,
+            "imported_by": imported_by,
+            "inherits": inherits,
+            "inherited_by": inherited_by,
+            "uses": uses,
+            "used_by": used_by,
+            "text": text_views,
+        }
+
+    def _build_gap_signals(
+        self,
+        node: BaseNode,
+        fact_card: Dict[str, Any],
+        relation_views: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        metadata = node.metadata or {}
+        qname = fact_card.get("qualified_name", "")
+        code_span = metadata.get("code_span", "")
+
+        name_tokens = set(self._split_identifier_tokens(qname))
+        code_identifiers = set(self._extract_code_identifiers(code_span))
+        overlap = len(name_tokens & code_identifiers)
+        align_score = overlap / max(1, len(name_tokens)) if name_tokens else 1.0
+
+        called_count = relation_views.get("calls", {}).get("count", 0)
+        called_by_count = relation_views.get("called_by", {}).get("count", 0)
+        code_lines = int(fact_card.get("code_lines", 0) or 0)
+
+        flags = []
+        if align_score < 0.25 and fact_card.get("node_type") in ("FUNCTION", "METHOD", "ASYNC_FUNCTION", "ASYNC_METHOD"):
+            flags.append("possible_name_impl_gap")
+        if code_lines > 120:
+            flags.append("large_body")
+        if called_count == 0 and called_by_count == 0 and fact_card.get("node_type") in ("FUNCTION", "METHOD"):
+            flags.append("isolated_symbol")
+
+        return {
+            "name_alignment_score": round(align_score, 4),
+            "flags": flags,
+        }
+
+    def _build_composed_summary(
+        self,
+        fact_card: Dict[str, Any],
+        relation_views: Dict[str, Any],
+        gap_signals: Dict[str, Any],
+    ) -> str:
+        node_type = fact_card.get("node_type", "UNKNOWN")
+        qname = fact_card.get("qualified_name", "")
+        module = fact_card.get("module", "")
+        signature = fact_card.get("signature", "")
+        return_type = fact_card.get("return_type", "") or "unknown"
+
+        text_views = relation_views.get("text", {})
+        lines = [
+            f"{qname} [{node_type}] in module {module}.",
+        ]
+        if signature:
+            lines.append(f"Signature: {signature}")
+        if node_type in ("FUNCTION", "METHOD", "ASYNC_FUNCTION", "ASYNC_METHOD"):
+            lines.append(f"Return type: {return_type}")
+            lines.append(text_views.get("calls_view", "Calls: none"))
+            lines.append(text_views.get("called_by_view", "Called by: none"))
+        elif node_type == "CLASS":
+            lines.append(text_views.get("contains_view", "Contains: none"))
+            lines.append(text_views.get("inherits_view", "Inherits: none"))
+        elif node_type == "MODULE":
+            lines.append(text_views.get("contains_view", "Contains: none"))
+            lines.append(text_views.get("imports_view", "Imports: none"))
+        else:
+            lines.append(text_views.get("contained_by_view", "Contained by: none"))
+
+        flags = gap_signals.get("flags", [])
+        if flags:
+            lines.append(f"Gap signals: {', '.join(flags)}")
+        return " ".join(lines)
+
+    def _build_structured_enrichment(self, nodes: List[BaseNode]) -> None:
+        """一次性生成结构化汇聚信息（fact card + relation views + gap signals）。"""
+        out_index, in_index = self._build_relation_indexes()
+        for node in nodes:
+            fact_card = self._build_fact_card(node, out_index, in_index)
+            relation_views = self._build_relation_views(node, out_index, in_index)
+            gap_signals = self._build_gap_signals(node, fact_card, relation_views)
+            composed_summary = self._build_composed_summary(
+                fact_card=fact_card,
+                relation_views=relation_views,
+                gap_signals=gap_signals,
+            )
+
+            node.metadata["fact_card"] = json.dumps(fact_card, ensure_ascii=False)
+            node.metadata["relation_views"] = json.dumps(
+                relation_views, ensure_ascii=False
+            )
+            node.metadata["gap_signals"] = json.dumps(
+                gap_signals, ensure_ascii=False
+            )
+            node.metadata["composed_summary"] = composed_summary
+
+        print(f"🧩 结构化汇聚完成：{len(nodes)} 个节点")
+
 
     def _generate_llm_summaries(self, nodes: List[BaseNode]) -> List[BaseNode]:
         """
@@ -338,6 +629,14 @@ class CodeKGExtractor(TransformComponent):
                 if node_type in ("FUNCTION", "METHOD", "ASYNC_FUNCTION", "ASYNC_METHOD"):
                     code = node.metadata.get("code_span", "")
                     func_name = node.metadata.get("qualified_name", node.id_)
+                    fact_card = self._safe_json_load(node.metadata.get("fact_card"), {})
+                    if not isinstance(fact_card, dict):
+                        fact_card = {}
+                    fact_hint = (
+                        f"node_type={fact_card.get('node_type','')}, "
+                        f"return_type={fact_card.get('return_type','')}, "
+                        f"calls={fact_card.get('out_relation_counts',{}).get('CALLS',0)}"
+                    )
                     
                     if len(code) > MAX_FUNCTION_CODE_LENGTH:
                         summary = TOO_LONG_SUMMARY
@@ -354,6 +653,7 @@ class CodeKGExtractor(TransformComponent):
                         
                         prompt = function_prompt_template.format(
                             func_name=func_name,
+                            fact_hint=fact_hint,
                             code_snippet=code,
                             child_summaries_str=child_summaries_str[:800],
                         )
@@ -379,6 +679,7 @@ class CodeKGExtractor(TransformComponent):
                     child_summaries_str = "；".join(child_summaries) if child_summaries else "无内容"
                     
                     prompt = module_prompt_template.format(
+                        module_name=node.metadata.get("qualified_name", node.id_),
                         child_summaries_str=child_summaries_str[:800]
                     )
                     response = self.summary_model.complete(prompt)
@@ -410,6 +711,7 @@ class CodeKGExtractor(TransformComponent):
         function_prompt_template = """你是一个严谨的代码审查专家。请根据以下信息生成两段极简描述：
 
     函数名：{func_name}
+    事实卡片：{fact_hint}
     子调用/子组件摘要：
     {child_summaries_str}
     代码实现：
@@ -426,6 +728,7 @@ class CodeKGExtractor(TransformComponent):
     """
 
         module_prompt_template = """你是一个代码分析专家。请为以下模块生成极简描述（≤50字）：
+    模块：{module_name}
     包含的组件摘要：
     {child_summaries_str}
     """

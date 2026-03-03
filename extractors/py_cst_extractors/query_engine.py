@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 import asyncio
+import json
 
 from llama_index.core.base.response.schema import Response
 from llama_index.core.schema import QueryBundle, NodeWithScore
@@ -156,6 +157,37 @@ class CodeKGQueryEngine(BaseQueryEngine):
             "module_div": round(module_div, 4),
         }
 
+    def _parse_relation_views(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        relation_views = metadata.get("relation_views", {})
+        if isinstance(relation_views, dict):
+            return relation_views
+        if isinstance(relation_views, str):
+            text = relation_views.strip()
+            if text.startswith("{"):
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    return {}
+        return {}
+
+    def _relation_view_for_intent(self, metadata: Dict[str, Any], intent: str) -> str:
+        relation_views = self._parse_relation_views(metadata)
+        text_views = relation_views.get("text", {}) if isinstance(relation_views, dict) else {}
+        if not isinstance(text_views, dict):
+            return ""
+
+        if intent == "relationship":
+            keys = ("calls_view", "called_by_view", "inherits_view", "uses_view")
+        elif intent == "impact":
+            keys = ("called_by_view", "used_by_view", "imported_by_view", "contains_view")
+        else:
+            keys = ("contains_view", "imports_view", "calls_view")
+
+        lines = [text_views.get(k, "") for k in keys if text_views.get(k)]
+        return " | ".join(lines)
+
     def _has_minimum_slots(self, nodes: List[NodeWithScore], intent: str) -> bool:
         if not nodes:
             return False
@@ -240,17 +272,19 @@ class CodeKGQueryEngine(BaseQueryEngine):
 
         return merged_nodes, diagnostics
 
-    def _build_context(self, nodes: List[NodeWithScore]) -> List[str]:
+    def _build_context(self, nodes: List[NodeWithScore], intent: str) -> List[str]:
         context_lines = []
         for i, node in enumerate(nodes[:self.similarity_top_k], 1):
             metadata = node.node.metadata if node.node and node.node.metadata else {}
             qualified_name = metadata.get("qualified_name", "N/A")
             node_type = metadata.get("node_type", "UNKNOWN")
-            summary = metadata.get("llm_summary", "")
+            summary = metadata.get("llm_summary") or metadata.get("composed_summary", "")
+            relation_view = self._relation_view_for_intent(metadata, intent)
             text = node.node.text[:300] if node.node and node.node.text else "N/A"
             context_lines.append(
                 f"[{i}] {qualified_name} ({node_type})\n"
                 f"Summary: {summary or 'N/A'}\n"
+                f"RelationView: {relation_view or 'N/A'}\n"
                 f"Snippet: {text}"
             )
         return context_lines
@@ -281,16 +315,18 @@ class CodeKGQueryEngine(BaseQueryEngine):
         normalized_query: str,
         nodes: List[NodeWithScore],
         diagnostics: List[Dict[str, Any]],
+        intent: str,
     ) -> str:
         if not nodes:
             return "未找到相关知识图谱信息。"
 
-        context_lines = self._build_context(nodes)
+        context_lines = self._build_context(nodes, intent)
         synthesized = self._synthesize_with_llm(original_query, context_lines)
 
         parts = [f"查询：{original_query}"]
         if normalized_query != original_query:
             parts.append(f"标准化查询：{normalized_query}")
+        parts.append(f"意图：{intent}")
 
         if diagnostics:
             parts.append("检索诊断：")
@@ -311,5 +347,7 @@ class CodeKGQueryEngine(BaseQueryEngine):
         normalized_query = self._normalize_query(query_str)
         intent = self._infer_query_intent(normalized_query)
         nodes, diagnostics = self._progressive_retrieve(normalized_query, intent)
-        response_text = self._build_response(query_str, normalized_query, nodes, diagnostics)
+        response_text = self._build_response(
+            query_str, normalized_query, nodes, diagnostics, intent
+        )
         return Response(response=response_text, source_nodes=nodes)
