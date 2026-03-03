@@ -4,6 +4,7 @@
 from typing import Dict, List, Set, Optional, Tuple, Any
 from pathlib import Path
 from fnmatch import fnmatch
+import builtins
 
 import libcst as cst
 from libcst import MaybeSentinel
@@ -87,7 +88,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         
         self.symbol_table: Dict[str, SymbolInfo] = {}
         self._global_symbols: Set[str] = set()
-        self.unresolved_calls: List[Dict[str, str]] = []
+        self.unresolved_calls: List[Dict[str, Any]] = []
+        self._builtin_names: Set[str] = set(dir(builtins))
         
         # ✅ 代码段配置
         self.code_config = {
@@ -419,6 +421,46 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             return self._local_vars[name]
         return self._create_node_id(name)
 
+    def _resolve_relative_module(self, node: cst.ImportFrom) -> str:
+        """将 from-import 的相对模块名解析为绝对模块名。"""
+        module_name = get_name_string(node.module) if node.module else ""
+        relative_level = len(getattr(node, "relative", []) or [])
+        if relative_level <= 0:
+            return module_name
+
+        current_parts = self.module_name.split(".")
+        base_parts = current_parts[:-relative_level] if len(current_parts) >= relative_level else []
+        if module_name:
+            if base_parts:
+                return ".".join([*base_parts, module_name])
+            return module_name
+        return ".".join(base_parts)
+
+    def _has_local_symbol_id(self, node_id: str) -> bool:
+        return any(symbol.node_id == node_id for symbol in self.symbol_table.values())
+
+    def _record_unresolved_call(
+        self,
+        caller_id: str,
+        func_name: str,
+        node: cst.Call,
+        is_super_call: bool,
+        candidate_id: Optional[str] = None,
+    ) -> None:
+        self.unresolved_calls.append({
+            "caller_id": caller_id,
+            "caller_module": self.module_name,
+            "func_name": func_name,
+            "candidate_id": candidate_id or "",
+            "file_path": self.file_path,
+            "line_number": self._get_line_number(node),
+            "is_super_call": is_super_call,
+        })
+
+    def _is_builtin_call(self, func_name: str) -> bool:
+        head = func_name.split(".", 1)[0]
+        return head in self._builtin_names
+
     def _ensure_module_node(self, module_name: str) -> str:
         """
         确保模块节点存在
@@ -678,7 +720,7 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         Args:
             node: 从导入节点
         """
-        module_name = get_name_string(node.module) if node.module else ""
+        module_name = self._resolve_relative_module(node)
         
         if isinstance(node.names, cst.ImportStar):
             self._import_map["*"] = module_name
@@ -793,6 +835,9 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         func_name = get_call_name(node.func)
         if not func_name:
             return
+
+        if self._is_builtin_call(func_name):
+            return
         
         caller_id = self._current_function_id or self._current_class_id
         if not caller_id:
@@ -817,6 +862,10 @@ class CodeSymbolExtractor(cst.CSTVisitor):
                 return
                 
         elif "." in func_name:
+            prefix, suffix = func_name.split(".", 1)
+            if prefix in self._import_map:
+                callee_id = f"{self._import_map[prefix]}.{suffix}"
+                is_resolved = True
             if func_name in self.symbol_table:
                 callee_id = self.symbol_table[func_name].node_id
                 is_resolved = True
@@ -850,32 +899,41 @@ class CodeSymbolExtractor(cst.CSTVisitor):
         
         if is_resolved and callee_id:
             if callee_id == caller_id:
-                self.unresolved_calls.append({
-                    'caller_id': caller_id,
-                    'func_name': func_name,
-                    'file_path': self.file_path,
-                    'line_number': self._get_line_number(node),
-                    'is_super_call': func_name.startswith("super."),
-                })
+                self._record_unresolved_call(
+                    caller_id=caller_id,
+                    func_name=func_name,
+                    node=node,
+                    is_super_call=func_name.startswith("super."),
+                    candidate_id=callee_id,
+                )
             else:
-                self._add_relation(caller_id, callee_id, TypeManager.REL_CALLS, {
-                    "call_site": self.file_path,
-                    "is_cross_file": is_cross_file_call,
-                    "is_super_call": func_name.startswith("super."),
-                })
+                if self._has_local_symbol_id(callee_id):
+                    self._add_relation(caller_id, callee_id, TypeManager.REL_CALLS, {
+                        "call_site": self.file_path,
+                        "is_cross_file": is_cross_file_call,
+                        "is_super_call": func_name.startswith("super."),
+                    })
+                else:
+                    self._record_unresolved_call(
+                        caller_id=caller_id,
+                        func_name=func_name,
+                        node=node,
+                        is_super_call=func_name.startswith("super."),
+                        candidate_id=callee_id,
+                    )
                 
                 for qname, symbol in self.symbol_table.items():
                     if symbol.node_id == callee_id:
                         symbol.references.append(caller_id)
                         break
         else:
-            self.unresolved_calls.append({
-                'caller_id': caller_id,
-                'func_name': func_name,
-                'file_path': self.file_path,
-                'line_number': self._get_line_number(node),
-                'is_super_call': func_name.startswith("super."),
-            })
+            self._record_unresolved_call(
+                caller_id=caller_id,
+                func_name=func_name,
+                node=node,
+                is_super_call=func_name.startswith("super."),
+                candidate_id=callee_id,
+            )
 
     def visit_Attribute(self, node: cst.Attribute) -> None:
         """
@@ -939,6 +997,8 @@ class CodeSymbolExtractor(cst.CSTVisitor):
             symbol_table=self.symbol_table,
             file_path=self.file_path,
             unresolved_calls=self.unresolved_calls,
+            import_map=dict(self._import_map),
+            module_name=self.module_name,
         )
 
 

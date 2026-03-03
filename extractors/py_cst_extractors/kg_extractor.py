@@ -36,6 +36,10 @@ class CodeKGExtractor(TransformComponent):
     # ✅ LLM Summary 配置
     enable_llm_summary: bool = Field(default=False, description="是否启用 LLM 生成摘要")
     summary_model: Optional[Any] = Field(default=None, description="LLM 模型实例")
+    summary_strategy: str = Field(
+        default="hybrid",
+        description="摘要策略: independent|hybrid|bottom_up",
+    )
     
     _cache: Dict[str, Tuple[List[EntityNode], List[Relation]]] = PrivateAttr(default_factory=dict)
     _all_nodes: List[BaseNode] = PrivateAttr(default_factory=list)
@@ -57,6 +61,7 @@ class CodeKGExtractor(TransformComponent):
         source_root: str = ".", 
         enable_llm_summary: bool = False,
         summary_model: Optional[Any] = None,
+        summary_strategy: str = "hybrid",
         **kwargs: Any
     ):
         """初始化"""
@@ -64,6 +69,7 @@ class CodeKGExtractor(TransformComponent):
             source_root=source_root, 
             enable_llm_summary=enable_llm_summary,
             summary_model=summary_model,
+            summary_strategy=summary_strategy,
             **kwargs
         )
         self._cache = {}
@@ -143,15 +149,25 @@ class CodeKGExtractor(TransformComponent):
                 entity = self._code_node_to_entity(code_node)
                 self._entity_pool[entity.name] = entity  # name = qualified_name
         
+        relation_seen = set()
+
         # 2. 构建 Relation 池（文件内关系）
         for result in self._file_results:
             for code_rel in result.relations:
                 relation = self._code_relation_to_relation(code_rel)
+                rel_key = (relation.source_id, relation.label, relation.target_id)
+                if rel_key in relation_seen:
+                    continue
+                relation_seen.add(rel_key)
                 self._relation_pool.append(relation)
         
         # 3. 添加跨文件关系
         for code_rel in self._cross_file_relations:
             relation = self._code_relation_to_relation(code_rel)
+            rel_key = (relation.source_id, relation.label, relation.target_id)
+            if rel_key in relation_seen:
+                continue
+            relation_seen.add(rel_key)
             self._relation_pool.append(relation)
         
         print(f"📦 全局池构建完成：{len(self._entity_pool)} 实体，{len(self._relation_pool)} 关系")
@@ -254,6 +270,8 @@ class CodeKGExtractor(TransformComponent):
         
         MAX_FUNCTION_CODE_LENGTH = 2000
         TOO_LONG_SUMMARY = "This function is too long to summarize."
+        strategy = (self.summary_strategy or "hybrid").lower()
+        include_child_summaries = strategy in ("hybrid", "bottom_up")
         
         # ========== 1. 构建索引 ==========
         node_map = {node.id_: node for node in nodes}
@@ -292,7 +310,8 @@ class CodeKGExtractor(TransformComponent):
                 if rel.label in ("CALLS", "CONTAINS"):
                     target_chunk_id = qname_to_chunk_id.get(rel.target_id)
                     if target_chunk_id:
-                        dfs(target_chunk_id)
+                        if include_child_summaries:
+                            dfs(target_chunk_id)
             
             # --- 再处理当前节点 (后序) ---
             _process_node(node)
@@ -326,9 +345,10 @@ class CodeKGExtractor(TransformComponent):
                         summary = fallback_summary
                     else:
                         # 收集子摘要 (CALLS + CONTAINS)
-                        child_summaries = _get_child_summaries(
-                            node.id_, 
-                            ["CALLS", "CONTAINS"]
+                        child_summaries = (
+                            _get_child_summaries(node.id_, ["CALLS", "CONTAINS"])
+                            if include_child_summaries
+                            else []
                         )
                         child_summaries_str = "；".join(child_summaries) if child_summaries else "无"
                         
@@ -351,9 +371,10 @@ class CodeKGExtractor(TransformComponent):
                 
                 elif node_type == "MODULE":
                     # 仅收集 CONTAINS
-                    child_summaries = _get_child_summaries(
-                        node.id_, 
-                        ["CONTAINS"]
+                    child_summaries = (
+                        _get_child_summaries(node.id_, ["CONTAINS"])
+                        if include_child_summaries
+                        else []
                     )
                     child_summaries_str = "；".join(child_summaries) if child_summaries else "无内容"
                     

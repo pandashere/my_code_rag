@@ -50,7 +50,9 @@ class ExtractionResult:
     errors: List[str] = field(default_factory=list)
     symbol_table: Dict[str, "SymbolInfo"] = field(default_factory=dict)
     file_path: Optional[str] = None
-    unresolved_calls: List[Dict[str, str]] = field(default_factory=list)
+    unresolved_calls: List[Dict[str, Any]] = field(default_factory=list)
+    import_map: Dict[str, str] = field(default_factory=dict)
+    module_name: Optional[str] = None
     
     @property
     def node_count(self) -> int:
@@ -91,6 +93,9 @@ class ExtractionResult:
         seen_relations: Set[Tuple[str, str, str]] = set()
         
         qname_to_symbol = global_symbol_table
+        name_to_symbols: Dict[str, List["SymbolInfo"]] = {}
+        for symbol in qname_to_symbol.values():
+            name_to_symbols.setdefault(symbol.name, []).append(symbol)
         
         class_to_symbol: Dict[str, "SymbolInfo"] = {}
         for qname, symbol in qname_to_symbol.items():
@@ -98,11 +103,15 @@ class ExtractionResult:
                 class_to_symbol[symbol.name] = symbol
         
         for result in results:
+            import_map = result.import_map or {}
+            module_name = result.module_name or ""
             for call_info in result.unresolved_calls:
                 caller_id = call_info["caller_id"]
                 func_name = call_info["func_name"]
                 call_file = call_info.get("file_path", result.file_path)
                 is_super_call = call_info.get("is_super_call", False)
+                candidate_id = call_info.get("candidate_id")
+                caller_module = call_info.get("caller_module", module_name)
                 
                 callee_symbol = None
                 
@@ -113,13 +122,61 @@ class ExtractionResult:
                     )
                 
                 if not callee_symbol:
-                    if func_name in qname_to_symbol:
-                        callee_symbol = qname_to_symbol[func_name]
+                    candidate_qnames = []
+                    if candidate_id:
+                        candidate_qnames.append(candidate_id)
+
+                    if func_name in import_map:
+                        candidate_qnames.append(import_map[func_name])
+                    elif "*" in import_map and "." not in func_name:
+                        candidate_qnames.append(f"{import_map['*']}.{func_name}")
+
+                    if "." in func_name:
+                        prefix, suffix = func_name.split(".", 1)
+                        if prefix in import_map:
+                            candidate_qnames.append(f"{import_map[prefix]}.{suffix}")
+                        candidate_qnames.append(func_name)
+                    else:
+                        candidate_qnames.append(func_name)
+                        if caller_module:
+                            candidate_qnames.append(f"{caller_module}.{func_name}")
+
+                    for qname in candidate_qnames:
+                        if qname in qname_to_symbol:
+                            callee_symbol = qname_to_symbol[qname]
+                            break
+
+                    if not callee_symbol:
+                        for qname in candidate_qnames:
+                            suffix = f".{qname}"
+                            suffix_matches = [
+                                s for name, s in qname_to_symbol.items()
+                                if name.endswith(suffix)
+                            ]
+                            if suffix_matches:
+                                callee_symbol = suffix_matches[0]
+                                break
                     
                     if not callee_symbol:
                         callee_symbol = resolve_by_method_name_cross_file(
-                            func_name, caller_id, qname_to_symbol
+                            func_name.split(".")[-1], caller_id, qname_to_symbol
                         )
+
+                    if not callee_symbol:
+                        name_key = func_name.split(".")[-1]
+                        candidates = name_to_symbols.get(name_key, [])
+                        if candidates:
+                            if caller_module:
+                                same_pkg = [
+                                    c for c in candidates
+                                    if c.qualified_name.startswith(caller_module.rsplit(".", 1)[0])
+                                ]
+                                if same_pkg:
+                                    callee_symbol = same_pkg[0]
+                                else:
+                                    callee_symbol = candidates[0]
+                            else:
+                                callee_symbol = candidates[0]
                 
                 if callee_symbol and callee_symbol.node_id != caller_id:
                     rel_key = (caller_id, callee_symbol.node_id, TypeManager.REL_CALLS)

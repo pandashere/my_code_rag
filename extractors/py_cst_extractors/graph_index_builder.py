@@ -1,7 +1,6 @@
 # llama_index_integration/index_builder.py
 
 from llama_index.core.indices.property_graph import PropertyGraphIndex
-from llama_index.core.storage.storage_context import StorageContext
 from .kg_extractor import CodeKGExtractor
 
 
@@ -11,13 +10,22 @@ class CodeKGIndexBuilder:
         source_root: str,
         llm=None,
         embed_model=None,
+        enable_llm_summary: bool = False,
+        summary_strategy: str = "hybrid",
     ):
         self.source_root = source_root
         self.llm = llm
         self.embed_model = embed_model
+        self.enable_llm_summary = enable_llm_summary
+        self.summary_strategy = summary_strategy
         
         # ✅ CodeKGExtractor 本身就是 TransformComponent
-        self.kg_extractor = CodeKGExtractor(source_root, False, self.llm)
+        self.kg_extractor = CodeKGExtractor(
+            source_root=source_root,
+            enable_llm_summary=enable_llm_summary,
+            summary_model=self.llm,
+            summary_strategy=summary_strategy,
+        )
         
         # ✅ Neo4j Graph Store
         from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
